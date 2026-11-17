@@ -1,0 +1,9 @@
+# Runtime event data and local configuration (may contain credentials / client IPs)
+cmcd-data/
+cmcd-logger.config.php
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -212,6 +212,10 @@ The files are plain text, so you can also process them with `jq`, `grep` and sim
 - Protect the viewer with `viewer_user` and `viewer_pass`, or with your web server's own auth.
 - The stored IP addresses and User-Agents may be personal data. Set `store_client_info` to `false` if you don't need them, and choose a retention period that matches your data-protection policy.
 
+## Credits
+
+Written with [Claude Code](https://claude.com/claude-code), Anthropic's AI coding assistant (Claude Opus 5.5), working with Paul Higgs. The parsing, validation rules and event/key tables were checked against the published CTA-5004-B specification.
+
 ## License
 
 BSD 3-Clause, see [LICENSE](LICENSE).

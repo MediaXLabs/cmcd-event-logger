@@ -3,21 +3,43 @@
 `cmcd-logger.php` is a single PHP script that receives CMCD (Common Media Client Data) reports from media players. CMCD is defined in **CTA-5004-B**. The script:
 
 - accepts reports sent by **Event Mode** HTTP POST, and also by the **query-argument** (`?CMCD=`) and **header** (`CMCD-Request/Object/Status/Session`) transmission modes
-- stores every report in a daily log file, with the time it arrived, the client IP address and User-Agent, the raw text and the parsed keys
+- stores every report in an **SQLite** database, with the time it arrived, the client IP address and User-Agent, the raw text and the parsed keys
 - checks each report against the CTA-5004-B rules and stores any warnings with it
 - deletes stored reports once they are older than a configurable retention period (**default: 6 months**)
 - serves a web page that lists stored events, with filters, auto-refresh and JSON, CSV or JSONL export
 
-There is no database and no extra PHP extension to install.
+The database is a single file that the script creates the first time it runs. You don't need a database server.
 
 ---
 
-## Requirements
+## Prerequisites
 
-- PHP **8.1 or later**, with only the extensions that are always built in (`json`, `pcre`, `date`)
-- A web server that can run PHP, such as Apache with mod_php or PHP-FPM, or nginx with PHP-FPM. PHP's built-in server is fine for local testing.
-- The web server user needs write access to the data directory
-- HTTPS is recommended (§6 item 14 of the spec)
+| Requirement | Details |
+|---|---|
+| **PHP 8.1 or later** | The script uses PHP 8.1 features such as `array_is_list`. Check your version with `php -v`. |
+| **`pdo_sqlite` extension** | Used to store events. It needs SQLite 3.7 or later; PHP's bundled copy is fine. The other extensions it uses (`json`, `pcre`, `date`) are always built in. |
+| **A web server running PHP** | For example Apache (mod_php or PHP-FPM) or nginx with PHP-FPM. PHP's built-in server (`php -S`) is fine for local testing. |
+| **A writable data directory on a local disk** | The web server user must be able to create files in the directory as well as write the database file. In WAL mode SQLite keeps `-wal` and `-shm` files next to the database. Don't put the database on a network share (SMB/NFS), because SQLite's file locking isn't reliable there. |
+| **HTTPS** (recommended) | Recommended by CTA-5004-B §6 item 14. It's also needed if the players run on HTTPS pages, because browsers block mixed content. |
+
+### Enabling `pdo_sqlite`
+
+Check whether it's already loaded:
+
+```sh
+php -m | grep -i pdo_sqlite      # Windows PowerShell: php -m | Select-String pdo_sqlite
+```
+
+If nothing is printed, enable it for your platform:
+
+- **Windows** (php.net zip builds): in `php.ini`, uncomment `extension=pdo_sqlite` and make sure `extension_dir` points at PHP's `ext` folder. Run `php --ini` to see which `php.ini` is loaded.
+- **Debian / Ubuntu**: `sudo apt install php-sqlite3`
+- **RHEL / Rocky / Fedora**: `sudo dnf install php-pdo`
+- **Alpine**: `apk add php83-pdo_sqlite` (use the package name for your PHP version)
+- **macOS (Homebrew)**: `brew install php`, which includes `pdo_sqlite`
+- **Docker `php:*` official images**: already included
+
+The command-line PHP and the web server's PHP (PHP-FPM, mod_php) often load **different `php.ini` files**. After enabling the extension, restart PHP-FPM or Apache. To confirm the web server has it, open the viewer page: if `pdo_sqlite` is missing, the page reports *"The pdo_sqlite PHP extension is required"*.
 
 ## Installation
 
@@ -68,13 +90,15 @@ You can set options in three ways. Later ones override earlier ones:
 
 | Option | Env variable | Default | Meaning |
 |---|---|---|---|
-| `data_dir` | `CMCD_DATA_DIR` | `./cmcd-data` | Where daily `events-YYYY-MM-DD.jsonl` files are written |
+| `data_dir` | `CMCD_DATA_DIR` | `./cmcd-data` | Directory that holds the SQLite database. It must be writable and on a local disk. |
+| `db_file` | `CMCD_DB_FILE` | `cmcd-events.sqlite` | Database file name inside `data_dir` |
 | `retention` | `CMCD_RETENTION` | `P6M` | How long reports are kept. Use an ISO 8601 duration (`P6M`, `P90D`, `P1Y`) or a number of days (`180`) |
-| `purge_interval` | – | `3600` | Minimum number of seconds between sweeps for expired files |
+| `purge_interval` | – | `3600` | Minimum number of seconds between deletions of expired reports |
 | `max_body_bytes` | – | `1048576` | Largest POST body accepted (larger bodies get `413`) |
 | `max_payloads` | – | `5000` | Most records stored from a single POST |
 | `cors_allow_origin` | `CMCD_CORS_ORIGIN` | `*` | Value of `Access-Control-Allow-Origin` (`''` turns CORS headers off) |
 | `store_client_info` | – | `true` | Whether to record the client IP address and User-Agent |
+| `trusted_proxies` | `CMCD_TRUSTED_PROXIES` (comma-separated) | empty | Reverse proxies or load balancers in front of the script, as IPs or CIDR ranges (e.g. `127.0.0.1, 10.0.0.0/8`). See [Client IP addresses](#client-ip-addresses). |
 | `viewer_user` / `viewer_pass` | `CMCD_VIEW_USER` / `CMCD_VIEW_PASS` | empty | If set, the viewer requires HTTP Basic auth. Report submission is never authenticated. |
 | `page_size` | – | `100` | Events shown per page in the viewer |
 | `max_export_rows` | – | `100000` | Most rows in one export |
@@ -82,9 +106,25 @@ You can set options in three ways. Later ones override earlier ones:
 
 ### Retention
 
-Reports are stored in one file per UTC day. A purge runs at most once per `purge_interval`, triggered by a POST or a viewer request, and deletes any whole-day file that is entirely older than the retention cutoff. The viewer and exports also hide any record older than the cutoff, so what you see always matches the retention setting.
+A purge runs at most once per `purge_interval`, triggered by a POST or a viewer request. It deletes every report received before *now − retention*. The database uses incremental auto-vacuum, so space freed by deleted reports is given back to the file system. The viewer and exports also hide any record older than the cutoff, so what you see always matches the retention setting, even between purges.
 
 You don't need a cron job. On a server that receives little traffic you can force a sweep at a set time by requesting the viewer URL.
+
+### Client IP addresses
+
+Every stored report records the IP address of the player that sent it (`ip` column, indexed). You can filter on it in the viewer.
+
+- **Players connect directly** (no proxy): the address is the TCP peer address (`REMOTE_ADDR`), and no configuration is needed.
+- **Behind a reverse proxy, load balancer or CDN**: `REMOTE_ADDR` is the proxy's address, so every report would appear to come from the proxy. List the proxy addresses in `trusted_proxies`. When a request comes from one of them, the client address is read from `X-Forwarded-For`. The header is read from right to left, skipping trusted proxies, and the first untrusted address is used. Entries further to the left are ignored, because the client can forge them.
+- Requests from addresses that aren't trusted proxies **ignore** `X-Forwarded-For`, so a player can't fake its address.
+
+```php
+'trusted_proxies' => ['127.0.0.1', '::1', '10.0.0.0/8'],   // e.g. nginx on the same host + an internal LB
+```
+
+For nginx in front of PHP-FPM, make sure the proxy sets the header: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`
+
+Set `store_client_info` to `false` to stop recording IP addresses and User-Agents altogether.
 
 ## Sending reports
 
@@ -131,7 +171,7 @@ CMCD v1 JSON is also accepted: either an object of keys, or an array of objects 
 | `204 No Content` | Stored (§5 item 11). The `X-CMCD-Events-Stored` header gives the number of records stored. |
 | `400` | The request contained no CMCD payload |
 | `413` | The body was larger than `max_body_bytes` |
-| `500` | The data directory could not be written |
+| `500` | The report could not be written to the database, or `pdo_sqlite` is missing or the data directory isn't writable |
 
 `OPTIONS` preflight requests are answered with `204`. The answer always allows `CMCD-Request`, `CMCD-Object`, `CMCD-Status`, `CMCD-Session`, `Content-Type` and `Authorization` (§6 item 11).
 
@@ -175,9 +215,10 @@ Open the script URL in a browser:
   - event type (`e`)
   - session ID (`sid`)
   - content ID (`cid`)
+  - client IP address: an exact address, or a prefix ending in `*` such as `192.168.1.*`. The box suggests the most recently active client IPs, with an event count for each.
   - free-text search
   - "only reports with issues"
-- Click a `sid` or `cid` value to filter on it. Filtering on one `sid` shows that player session's timeline.
+- Click a `sid`, `cid` or client IP value to filter on it. Filtering on one `sid` shows that player session's timeline. Filtering on an IP shows everything one device or test rig has sent.
 - **Details** expands a row to show any warnings and the full stored record: the raw payload, the parsed keys, the client IP address and the User-Agent.
 - **Auto-refresh** reloads the page every 5, 15 or 60 seconds while you watch a test.
 - **Exports** use the current filters:
@@ -185,26 +226,40 @@ Open the script URL in a browser:
   - `?format=csv`
   - `?format=jsonl`
 
-Example: `cmcd-logger.php?sid=session-id-123&e=ps&format=csv`
+Examples:
+- `cmcd-logger.php?sid=session-id-123&e=ps&format=csv`
+- `cmcd-logger.php?ip=192.168.1.*&issues=1`
 
 ## Storage format
 
-`data_dir/events-YYYY-MM-DD.jsonl` contains one JSON object per line:
+Events are stored in `data_dir/cmcd-events.sqlite`, in the table `events`, one row per CMCD record. The script creates the schema itself the first time it runs. The schema version is kept in `PRAGMA user_version`.
 
-```json
-{"id":"eda8b620a946aa07","rx":1794915715774,"src":"body","ip":"203.0.113.7","ua":"…",
- "ct":"application/cmcd","raw":"e=ps,sid=\"s1\",sta=p,ts=1764269150889,v=2",
- "data":{"e":"ps","sid":"s1","sta":"p","ts":1764269150889,"v":2}}
+| Column | Content |
+|---|---|
+| `id` | Auto-incrementing row ID |
+| `rx` | Time the server received the report (ms since epoch, UTC). Indexed. |
+| `src` | `body`, `header`, `query`, `json` or `form` |
+| `ip` | IP address of the reporting client. Comes from `X-Forwarded-For` when the request arrives through a trusted proxy. Indexed. |
+| `ua`, `origin`, `ct` | User-Agent, `Origin` header and request content type |
+| `e`, `sid`, `cid`, `sn`, `ts`, `sta`, `v` | Copies of these CMCD keys, kept as separate columns so the viewer can filter on them. `sid`, `cid` and `e` are indexed. |
+| `raw` | The payload as received |
+| `data` | All parsed keys, as a JSON object |
+| `err` | Parse or version error (NULL if none) |
+| `warn` | Conformance warnings as a JSON array (NULL if none) |
+
+You can query the database directly with the `sqlite3` command-line tool or any SQLite client. For example:
+
+```sh
+sqlite3 cmcd-data/cmcd-events.sqlite \
+  "SELECT datetime(rx/1000,'unixepoch') AS received, e, sta, json_extract(data,'$.bl') AS bl
+     FROM events WHERE sid = 'session-id-123' ORDER BY rx;"
 ```
 
-| Field | Content |
-|---|---|
-| `rx` | Time the server received the report (ms since epoch, UTC) |
-| `src` | `body`, `header`, `query`, `json` or `form` |
-| `err` | Present only if the report has a parse or version error |
-| `warn` | Present only if the report has conformance warnings |
+Exports (`?format=json` / `jsonl`) produce one object per record with the fields `id`, `rx`, `src`, `ip`, `ua`, `origin`, `ct`, `raw`, `data`, `err` and `warn`.
 
-The files are plain text, so you can also process them with `jq`, `grep` and similar tools.
+To back up a running database, use `sqlite3 cmcd-events.sqlite ".backup backup.sqlite"` instead of copying the file, because a plain copy can miss changes still held in the `-wal` file.
+
+> Versions before the SQLite change stored events in daily `events-YYYY-MM-DD.jsonl` files. Those files are not imported automatically.
 
 ## Security notes
 

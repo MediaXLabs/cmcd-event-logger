@@ -9,8 +9,8 @@
  *     transmission modes),
  *   - checks each report against the CTA-5004-B key rules and records any
  *     warnings alongside it,
- *   - logs every report to daily JSON Lines files (no database / PHP extensions
- *     required),
+ *   - stores every report in an SQLite database (requires the pdo_sqlite
+ *     PHP extension),
  *   - deletes reports older than a configurable retention period
  *     (default 6 months), and
  *   - serves a web page (HTTP GET) to browse, filter and export stored events.
@@ -53,9 +53,13 @@ declare(strict_types=1);
 // ---------------------------------------------------------------------------
 
 $CONFIG = [
-    // Directory for stored events. Keep it outside the web root if you can.
-    // (env: CMCD_DATA_DIR)
+    // Directory holding the SQLite database (cmcd-events.sqlite plus its WAL
+    // files). Must be writable by the web server; keep it outside the web root
+    // if you can. (env: CMCD_DATA_DIR)
     'data_dir'          => getenv('CMCD_DATA_DIR') ?: __DIR__ . '/cmcd-data',
+
+    // Database file name inside data_dir. (env: CMCD_DB_FILE)
+    'db_file'           => getenv('CMCD_DB_FILE') ?: 'cmcd-events.sqlite',
 
     // How long to keep events: an ISO 8601 duration ("P6M", "P90D", "P1Y")
     // or a whole number of days. (env: CMCD_RETENTION)
@@ -74,6 +78,13 @@ $CONFIG = [
 
     // Record the reporting client's IP address and User-Agent.
     'store_client_info' => true,
+
+    // Reverse proxies / load balancers in front of this script, as IPs or CIDR
+    // ranges (e.g. ['127.0.0.1', '10.0.0.0/8']). When a request arrives from
+    // one of these, the client IP is taken from X-Forwarded-For instead of
+    // REMOTE_ADDR. Leave empty if clients connect directly.
+    // (env: CMCD_TRUSTED_PROXIES, comma-separated)
+    'trusted_proxies'   => array_filter(array_map('trim', explode(',', (string) getenv('CMCD_TRUSTED_PROXIES')))),
 
     // Optional HTTP Basic credentials protecting the viewer (reports are never
     // authenticated). Leave user empty to disable. (env: CMCD_VIEW_USER / CMCD_VIEW_PASS)
@@ -201,7 +212,7 @@ const CMCD_KEY_INFO = [
 date_default_timezone_set('UTC');
 
 try {
-    $store = new EventStore($CONFIG['data_dir'], parse_retention($CONFIG['retention']));
+    $store = new EventStore($CONFIG['data_dir'], parse_retention($CONFIG['retention']), $CONFIG['db_file']);
 } catch (Throwable $e) {
     http_response_code(500);
     header('Content-Type: text/plain; charset=utf-8');
@@ -343,7 +354,7 @@ function build_record(mixed $payload, string $src, int $now, string $contentType
         'src' => $src,
     ];
     if ($cfg['store_client_info']) {
-        $rec['ip'] = $_SERVER['REMOTE_ADDR'] ?? '';
+        $rec['ip'] = client_ip((array) $cfg['trusted_proxies']);
         $rec['ua'] = substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 512);
     }
     if (!empty($_SERVER['HTTP_ORIGIN'])) {
@@ -381,6 +392,56 @@ function build_record(mixed $payload, string $src, int $now, string $contentType
         $rec['warn'] = $warn;
     }
     return $rec;
+}
+
+/**
+ * The reporting client's IP address. If the direct peer is a trusted proxy,
+ * walks X-Forwarded-For from the right and returns the first untrusted hop
+ * (the left-most entries can be forged by the client).
+ */
+function client_ip(array $trustedProxies): string
+{
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    if (!$trustedProxies || !ip_in_ranges($ip, $trustedProxies)) {
+        return $ip;
+    }
+    $hops = array_filter(array_map('trim', explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '')));
+    foreach (array_reverse($hops) as $hop) {
+        if (filter_var($hop, FILTER_VALIDATE_IP) === false) {
+            break; // malformed chain: stop at the last trustworthy address
+        }
+        $ip = $hop;
+        if (!ip_in_ranges($hop, $trustedProxies)) {
+            break;
+        }
+    }
+    return $ip;
+}
+
+/** True if $ip equals one of $ranges or falls inside one of its CIDR blocks (IPv4 or IPv6). */
+function ip_in_ranges(string $ip, array $ranges): bool
+{
+    $bin = @inet_pton($ip);
+    if ($bin === false) {
+        return false;
+    }
+    foreach ($ranges as $range) {
+        [$net, $bits] = array_pad(explode('/', (string) $range, 2), 2, null);
+        $netBin = @inet_pton(trim($net));
+        if ($netBin === false || strlen($netBin) !== strlen($bin)) {
+            continue;
+        }
+        $bits = $bits === null ? strlen($bin) * 8 : max(0, min((int) $bits, strlen($bin) * 8));
+        $bytes = intdiv($bits, 8);
+        if (substr($bin, 0, $bytes) !== substr($netBin, 0, $bytes)) {
+            continue;
+        }
+        $rem = $bits % 8;
+        if ($rem === 0 || ((ord($bin[$bytes]) ^ ord($netBin[$bytes])) & (0xFF << (8 - $rem)) & 0xFF) === 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /** Conformance checks against CTA-5004-B; returns human-readable warnings. */
@@ -635,27 +696,81 @@ function lenient_parse(string $s): array
 }
 
 // ---------------------------------------------------------------------------
-// Storage: one JSON Lines file per UTC day; retention enforced per file
+// Storage: SQLite (pdo_sqlite) — one row per CMCD record
 // ---------------------------------------------------------------------------
 
 final class EventStore
 {
-    public function __construct(private string $dir, private DateInterval $retention)
+    private const SCHEMA_VERSION = 2; // 2: index on ip
+    private const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
+
+    private PDO $db;
+    private string $path;
+
+    public function __construct(string $dir, private DateInterval $retention, string $file = 'cmcd-events.sqlite')
     {
-        if (!is_dir($this->dir) && !@mkdir($this->dir, 0775, true) && !is_dir($this->dir)) {
-            throw new RuntimeException('Cannot create data directory ' . $this->dir);
+        if (!extension_loaded('pdo_sqlite')) {
+            throw new RuntimeException('The pdo_sqlite PHP extension is required: enable "extension=pdo_sqlite" in php.ini');
         }
-        $ht = $this->dir . '/.htaccess';
-        if (!is_file($ht)) {
-            @file_put_contents($ht, "<IfModule mod_authz_core.c>\n  Require all denied\n</IfModule>\n"
+        if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
+            throw new RuntimeException('Cannot create data directory ' . $dir);
+        }
+        if (!is_file($dir . '/.htaccess')) {
+            @file_put_contents($dir . '/.htaccess', "<IfModule mod_authz_core.c>\n  Require all denied\n</IfModule>\n"
                 . "<IfModule !mod_authz_core.c>\n  Deny from all\n</IfModule>\n");
-            @file_put_contents($this->dir . '/index.html', '');
+            @file_put_contents($dir . '/index.html', '');
         }
+
+        $this->path = $dir . '/' . $file;
+        $isNew = !is_file($this->path);
+        $this->db = new PDO('sqlite:' . $this->path, null, null, [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+        $this->db->exec('PRAGMA busy_timeout = 5000');
+        if ($isNew) {
+            $this->db->exec('PRAGMA auto_vacuum = INCREMENTAL'); // must precede table creation
+        }
+        $this->db->exec('PRAGMA journal_mode = WAL');
+        $this->db->exec('PRAGMA synchronous = NORMAL');
+        $this->migrate();
     }
 
-    public function retention(): DateInterval
+    private function migrate(): void
     {
-        return $this->retention;
+        $ver = (int) $this->db->query('PRAGMA user_version')->fetchColumn();
+        if ($ver >= self::SCHEMA_VERSION) {
+            return;
+        }
+        $this->db->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS events (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                rx     INTEGER NOT NULL,   -- server receive time, ms since epoch (UTC)
+                src    TEXT    NOT NULL,   -- body | header | query | json | form
+                ip     TEXT,
+                ua     TEXT,
+                origin TEXT,
+                ct     TEXT,               -- request content type
+                e      TEXT,               -- CMCD keys promoted to columns for filtering
+                sid    TEXT,
+                cid    TEXT,
+                sn     INTEGER,
+                ts     INTEGER,
+                sta    TEXT,
+                v      INTEGER,
+                raw    TEXT,               -- payload as received
+                data   TEXT    NOT NULL,   -- parsed keys, JSON object
+                err    TEXT,               -- parse / version error
+                warn   TEXT                -- conformance warnings, JSON array
+            );
+            CREATE INDEX IF NOT EXISTS ix_events_rx  ON events (rx);
+            CREATE INDEX IF NOT EXISTS ix_events_sid ON events (sid, rx);
+            CREATE INDEX IF NOT EXISTS ix_events_cid ON events (cid, rx);
+            CREATE INDEX IF NOT EXISTS ix_events_e   ON events (e, rx);
+            CREATE INDEX IF NOT EXISTS ix_events_ip  ON events (ip, rx);
+            CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+            SQL);
+        $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
     }
 
     /** Oldest instant (ms since epoch) that is still within retention. */
@@ -665,97 +780,189 @@ final class EventStore
         return (int) $cut->format('U') * 1000;
     }
 
-    private function fileFor(string $ymd): string
-    {
-        return $this->dir . '/events-' . $ymd . '.jsonl';
-    }
-
     public function append(array $records, int $nowMs): void
     {
-        $lines = '';
-        foreach ($records as $r) {
-            $json = json_encode($r, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
-            if ($json === false) {
-                throw new RuntimeException('JSON encode failed: ' . json_last_error_msg());
+        $stmt = $this->db->prepare(
+            'INSERT INTO events (rx, src, ip, ua, origin, ct, e, sid, cid, sn, ts, sta, v, raw, data, err, warn)
+             VALUES (:rx, :src, :ip, :ua, :origin, :ct, :e, :sid, :cid, :sn, :ts, :sta, :v, :raw, :data, :err, :warn)'
+        );
+        $str = static fn($v): ?string => is_string($v) || is_int($v) || is_float($v) ? (string) $v : null;
+        $int = static fn($v): ?int => is_int($v) ? $v : null;
+
+        $this->db->beginTransaction();
+        try {
+            foreach ($records as $r) {
+                $data = json_encode($r['data'] ?? [], self::JSON_FLAGS);
+                if ($data === false) {
+                    throw new RuntimeException('JSON encode failed: ' . json_last_error_msg());
+                }
+                $stmt->execute([
+                    ':rx'     => $r['rx'] ?? $nowMs,
+                    ':src'    => $r['src'] ?? '',
+                    ':ip'     => $r['ip'] ?? null,
+                    ':ua'     => $r['ua'] ?? null,
+                    ':origin' => $r['origin'] ?? null,
+                    ':ct'     => $r['ct'] ?? null,
+                    ':e'      => $str(cmcd_value($r, 'e')),
+                    ':sid'    => $str(cmcd_value($r, 'sid')),
+                    ':cid'    => $str(cmcd_value($r, 'cid')),
+                    ':sn'     => $int(cmcd_value($r, 'sn')),
+                    ':ts'     => $int(cmcd_value($r, 'ts')),
+                    ':sta'    => $str(cmcd_value($r, 'sta')),
+                    ':v'      => $int(cmcd_value($r, 'v')),
+                    ':raw'    => $r['raw'] ?? null,
+                    ':data'   => $data,
+                    ':err'    => $r['err'] ?? null,
+                    ':warn'   => empty($r['warn']) ? null : json_encode($r['warn'], self::JSON_FLAGS),
+                ]);
             }
-            $lines .= $json . "\n";
-        }
-        $file = $this->fileFor(gmdate('Y-m-d', intdiv($nowMs, 1000)));
-        if (file_put_contents($file, $lines, FILE_APPEND | LOCK_EX) === false) {
-            throw new RuntimeException('Write failed: ' . $file);
+            $this->db->commit();
+        } catch (Throwable $e) {
+            $this->db->rollBack();
+            throw $e;
         }
     }
 
-    /** @return array<string,int> day (Y-m-d) => file size, newest first */
-    public function days(): array
-    {
-        $days = [];
-        foreach (glob($this->dir . '/events-*.jsonl') ?: [] as $f) {
-            if (preg_match('/events-(\d{4}-\d{2}-\d{2})\.jsonl$/', $f, $m)) {
-                $days[$m[1]] = (int) @filesize($f);
-            }
-        }
-        krsort($days);
-        return $days;
-    }
-
-    /** Deletes whole-day files that are entirely older than the retention cutoff. */
+    /** Deletes every record older than the retention cutoff; returns the number removed. */
     public function purge(): int
     {
-        $cutDay = gmdate('Y-m-d', intdiv($this->cutoffMs(), 1000));
-        $deleted = 0;
-        foreach (array_keys($this->days()) as $day) {
-            if ($day < $cutDay && @unlink($this->fileFor($day))) {
-                $deleted++;
-            }
+        $stmt = $this->db->prepare('DELETE FROM events WHERE rx < :cutoff');
+        $stmt->execute([':cutoff' => $this->cutoffMs()]);
+        $n = $stmt->rowCount();
+        if ($n > 0) {
+            $this->db->exec('PRAGMA incremental_vacuum');
         }
-        return $deleted;
+        return $n;
     }
 
     public function maybePurge(int $interval): void
     {
-        $marker = $this->dir . '/.last-purge';
-        $last = @filemtime($marker);
-        if ($last === false || time() - $last >= $interval) {
-            @touch($marker);
-            $this->purge();
+        $last = (int) $this->db->query("SELECT v FROM meta WHERE k = 'last_purge'")->fetchColumn();
+        if (time() - $last < $interval) {
+            return;
         }
+        $this->db->prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('last_purge', :t)")->execute([':t' => time()]);
+        $this->purge();
+    }
+
+    /** @return array<string,int> most recently active client IPs => event count */
+    public function recentIps(int $limit = 50): array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT ip, COUNT(*) AS n FROM events WHERE ip IS NOT NULL AND ip <> \'\' AND rx >= :cutoff
+             GROUP BY ip ORDER BY MAX(rx) DESC LIMIT :lim'
+        );
+        $stmt->bindValue(':cutoff', $this->cutoffMs(), PDO::PARAM_INT);
+        $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
+        $stmt->execute();
+        return array_column($stmt->fetchAll(), 'n', 'ip');
+    }
+
+    /** @return array{count:int, oldest:?int, newest:?int, bytes:int} */
+    public function stats(): array
+    {
+        $row = $this->db->query('SELECT COUNT(*) AS n, MIN(rx) AS lo, MAX(rx) AS hi FROM events')->fetch();
+        $bytes = 0;
+        foreach (['', '-wal'] as $suffix) {
+            $bytes += (int) @filesize($this->path . $suffix);
+        }
+        return [
+            'count'  => (int) $row['n'],
+            'oldest' => $row['lo'] !== null ? (int) $row['lo'] : null,
+            'newest' => $row['hi'] !== null ? (int) $row['hi'] : null,
+            'bytes'  => $bytes,
+        ];
     }
 
     /**
-     * Iterates stored records newest first.
-     * @param callable(array):bool $filter
-     * @return array{rows: array, more: bool}
+     * Builds the WHERE clause for viewer filters.
+     * @param array{from:string,to:string,sid:string,cid:string,e:string,q:string,issues:string} $f
      */
-    public function query(string $fromDay, string $toDay, ?string $text, callable $filter, int $offset, int $limit): array
+    private function where(array $f): array
     {
-        $cutoff = $this->cutoffMs();
-        $rows = [];
-        $matched = 0;
-        foreach (array_keys($this->days()) as $day) {
-            if ($day > $toDay || $day < $fromDay) {
-                continue;
-            }
-            $lines = @file($this->fileFor($day), FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
-            for ($k = count($lines) - 1; $k >= 0; $k--) {
-                $line = $lines[$k];
-                if ($text !== null && $text !== '' && stripos($line, $text) === false) {
-                    continue;
-                }
-                $rec = json_decode($line, true);
-                if (!is_array($rec) || ($rec['rx'] ?? 0) < $cutoff || !$filter($rec)) {
-                    continue;
-                }
-                if ($matched++ < $offset) {
-                    continue;
-                }
-                if (count($rows) >= $limit) {
-                    return ['rows' => $rows, 'more' => true];
-                }
-                $rows[] = $rec;
+        $w = ['rx >= :cutoff'];
+        $p = [':cutoff' => $this->cutoffMs()];
+        if ($f['from'] !== '') {
+            $w[] = 'rx >= :from';
+            $p[':from'] = strtotime($f['from'] . ' 00:00:00 UTC') * 1000;
+        }
+        if ($f['to'] !== '') {
+            $w[] = 'rx < :to';
+            $p[':to'] = (strtotime($f['to'] . ' 00:00:00 UTC') + 86400) * 1000;
+        }
+        if ($f['ip'] !== '') {
+            if (str_ends_with($f['ip'], '*')) {          // prefix match, e.g. 192.168.1.*
+                $w[] = "ip LIKE :ip ESCAPE '\\'";
+                $p[':ip'] = addcslashes(rtrim($f['ip'], '*'), '%_\\') . '%';
+            } else {
+                $w[] = 'ip = :ip';
+                $p[':ip'] = $f['ip'];
             }
         }
-        return ['rows' => $rows, 'more' => false];
+        foreach (['sid', 'cid'] as $k) {
+            if ($f[$k] !== '') {
+                $w[] = "$k = :$k";
+                $p[":$k"] = $f[$k];
+            }
+        }
+        if ($f['e'] === '-') {
+            $w[] = 'e IS NULL';
+        } elseif ($f['e'] !== '') {
+            $w[] = 'e = :e';
+            $p[':e'] = $f['e'];
+        }
+        if ($f['issues'] !== '') {
+            $w[] = '(err IS NOT NULL OR warn IS NOT NULL)';
+        }
+        if ($f['q'] !== '') {
+            $like = '%' . addcslashes($f['q'], '%_\\') . '%';
+            $w[] = "(raw LIKE :q1 ESCAPE '\\' OR data LIKE :q2 ESCAPE '\\' OR ua LIKE :q3 ESCAPE '\\' OR ip LIKE :q4 ESCAPE '\\')";
+            $p += [':q1' => $like, ':q2' => $like, ':q3' => $like, ':q4' => $like];
+        }
+        return [implode(' AND ', $w), $p];
+    }
+
+    /** @return array{rows: array, more: bool, total: int} newest first */
+    public function query(array $f, int $offset, int $limit): array
+    {
+        [$where, $p] = $this->where($f);
+        $count = $this->db->prepare("SELECT COUNT(*) FROM events WHERE $where");
+        $count->execute($p);
+        $rows = iterator_to_array($this->iterate($f, $limit + 1, $offset), false);
+        $more = count($rows) > $limit;
+        return ['rows' => array_slice($rows, 0, $limit), 'more' => $more, 'total' => (int) $count->fetchColumn()];
+    }
+
+    /** Streams matching records (newest first) without loading them all into memory. */
+    public function iterate(array $f, int $limit, int $offset = 0): Generator
+    {
+        [$where, $p] = $this->where($f);
+        $stmt = $this->db->prepare("SELECT * FROM events WHERE $where ORDER BY rx DESC, id DESC LIMIT :lim OFFSET :off");
+        foreach ($p as $k => $v) {
+            $stmt->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
+        }
+        $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
+        $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
+        $stmt->execute();
+        while ($row = $stmt->fetch()) {
+            yield self::toRecord($row);
+        }
+    }
+
+    /** Converts a DB row back to the record shape used by the viewer and exports. */
+    private static function toRecord(array $row): array
+    {
+        $r = ['id' => (int) $row['id'], 'rx' => (int) $row['rx'], 'src' => $row['src']];
+        foreach (['ip', 'ua', 'origin', 'ct', 'raw', 'err'] as $k) {
+            if ($row[$k] !== null) {
+                $r[$k] = $row[$k];
+            }
+        }
+        $r['data'] = json_decode($row['data'], true) ?? [];
+        if ($row['warn'] !== null) {
+            $r['warn'] = json_decode($row['warn'], true) ?? [];
+        }
+        return $r;
     }
 }
 
@@ -881,6 +1088,7 @@ function handle_viewer(array $cfg, EventStore $store): void
         'sid'  => $g('sid'),
         'cid'  => $g('cid'),
         'e'    => $g('e'),
+        'ip'   => $g('ip'),
         'q'    => $g('q'),
         'issues' => $g('issues') === '1' ? '1' : '',
     ];
@@ -888,40 +1096,25 @@ function handle_viewer(array $cfg, EventStore $store): void
     $page    = max(1, (int) ($g('page') ?: 1));
     $refresh = max(0, min(3600, (int) $g('refresh')));
 
-    $filter = static function (array $r) use ($f): bool {
-        if ($f['issues'] && empty($r['warn']) && empty($r['err'])) {
-            return false;
-        }
-        if ($f['sid'] !== '' && (string) cmcd_value($r, 'sid') !== $f['sid']) {
-            return false;
-        }
-        if ($f['cid'] !== '' && (string) cmcd_value($r, 'cid') !== $f['cid']) {
-            return false;
-        }
-        if ($f['e'] !== '') {
-            $e = cmcd_value($r, 'e');
-            if ($f['e'] === '-' ? $e !== null : (string) $e !== $f['e']) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    // ---- Exports -----------------------------------------------------------
+    // ---- Exports (streamed) --------------------------------------------------
     if (in_array($format, ['json', 'csv', 'jsonl'], true)) {
-        $res = $store->query($f['from'], $f['to'], $f['q'], $filter, 0, (int) $cfg['max_export_rows']);
+        $rows = $store->iterate($f, (int) $cfg['max_export_rows']);
         $name = 'cmcd-events-' . gmdate('Ymd-His');
-        if ($res['more']) {
-            header('X-CMCD-Truncated: true');
-        }
+        $jf = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
         if ($format === 'json') {
             header('Content-Type: application/json; charset=utf-8');
             header("Content-Disposition: inline; filename=\"$name.json\"");
-            echo json_encode($res['rows'], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            echo '[';
+            $first = true;
+            foreach ($rows as $r) {
+                echo $first ? "\n" : ",\n", json_encode($r, $jf);
+                $first = false;
+            }
+            echo "\n]\n";
         } elseif ($format === 'jsonl') {
             header('Content-Type: application/x-ndjson; charset=utf-8');
             header("Content-Disposition: attachment; filename=\"$name.jsonl\"");
-            foreach ($res['rows'] as $r) {
+            foreach ($rows as $r) {
                 echo json_encode($r, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE), "\n";
             }
         } else {
@@ -930,7 +1123,7 @@ function handle_viewer(array $cfg, EventStore $store): void
             $out = fopen('php://output', 'w');
             $safe = static fn($v) => is_string($v) && $v !== '' && strpbrk($v[0], "=+-@\t\r") !== false ? "'" . $v : $v;
             fputcsv($out, ['received', 'e', 'sid', 'cid', 'sn', 'ts', 'sta', 'src', 'ip', 'user_agent', 'data_json', 'raw', 'error', 'warnings'], ',', '"', '\\');
-            foreach ($res['rows'] as $r) {
+            foreach ($rows as $r) {
                 fputcsv($out, array_map($safe, [
                     fmt_ms($r['rx'] ?? null, $tz),
                     fmt_cmcd_value(cmcd_value($r, 'e') ?? ''),
@@ -955,9 +1148,8 @@ function handle_viewer(array $cfg, EventStore $store): void
 
     // ---- HTML page -----------------------------------------------------------
     $pageSize = (int) $cfg['page_size'];
-    $res = $store->query($f['from'], $f['to'], $f['q'], $filter, ($page - 1) * $pageSize, $pageSize);
-    $days = $store->days();
-    $totalBytes = array_sum($days);
+    $res = $store->query($f, ($page - 1) * $pageSize, $pageSize);
+    $stats = $store->stats();
 
     $self = strtok($_SERVER['REQUEST_URI'] ?? '', '?') ?: '';
     $link = static function (array $extra) use ($f, $refresh, $self): string {
@@ -1020,7 +1212,7 @@ details pre{white-space:pre-wrap;word-break:break-all;max-width:70vw;font-family
 <header>
   <h1>CMCD Event Log</h1>
   <span class="meta">Report endpoint: <code><?= h($reportUrl) ?></code></span>
-  <span class="meta">Retention: <code><?= h($retention) ?></code> &middot; <?= count($days) ?> day file(s), <?= h(number_format($totalBytes / 1024, 1)) ?> KiB
+  <span class="meta">Retention: <code><?= h($retention) ?></code> &middot; <?= h(number_format($stats['count'])) ?> stored event(s), <?= h(number_format($stats['bytes'] / 1048576, 2)) ?> MiB SQLite<?php if ($stats['oldest'] !== null): ?>, oldest <?= h(fmt_ms($stats['oldest'], $tz)) ?><?php endif; ?>
     &middot; times in <?= h($cfg['display_timezone']) ?></span>
 </header>
 <main>
@@ -1038,6 +1230,10 @@ details pre{white-space:pre-wrap;word-break:break-all;max-width:70vw;font-family
   </label>
   <label>Session ID (sid)<input type="text" name="sid" value="<?= h($f['sid']) ?>"></label>
   <label>Content ID (cid)<input type="text" name="cid" value="<?= h($f['cid']) ?>"></label>
+  <label title="Exact address, or a prefix ending in * (e.g. 192.168.1.*)">Client IP<input type="text" name="ip" list="recent-ips" placeholder="exact or prefix*" value="<?= h($f['ip']) ?>"></label>
+  <datalist id="recent-ips">
+    <?php foreach ($store->recentIps() as $rip => $n): ?><option value="<?= h($rip) ?>"><?= h(number_format($n)) ?> event(s)</option><?php endforeach; ?>
+  </datalist>
   <label>Text search<input type="text" name="q" value="<?= h($f['q']) ?>"></label>
   <label class="check"><span><input type="checkbox" name="issues" value="1"<?= $f['issues'] ? ' checked' : '' ?>> Only reports with issues</span></label>
   <label>Auto-refresh
@@ -1052,7 +1248,7 @@ details pre{white-space:pre-wrap;word-break:break-all;max-width:70vw;font-family
 </form>
 
 <div class="bar">
-  <span>Page <?= $page ?> &middot; showing <?= count($res['rows']) ?> event(s), newest first</span>
+  <span>Page <?= $page ?> &middot; showing <?= count($res['rows']) ?> of <?= h(number_format($res['total'])) ?> matching event(s), newest first</span>
   <span>Export: <a href="<?= $link(['format' => 'json']) ?>">JSON</a> · <a href="<?= $link(['format' => 'csv']) ?>">CSV</a> · <a href="<?= $link(['format' => 'jsonl']) ?>">JSONL</a></span>
 </div>
 
@@ -1062,7 +1258,7 @@ details pre{white-space:pre-wrap;word-break:break-all;max-width:70vw;font-family
 <?php else: ?>
 <table>
   <thead><tr>
-    <th>Received</th><th>Event (e)</th><th>Session (sid)</th><th>Content (cid)</th><th>sn</th><th>Client ts</th><th>State (sta)</th><th>Other keys</th><th>Source</th><th></th>
+    <th>Received</th><th>Event (e)</th><th>Session (sid)</th><th>Content (cid)</th><th>sn</th><th>Client ts</th><th>State (sta)</th><th>Other keys</th><th>Client IP</th><th>Source</th><th></th>
   </tr></thead>
   <tbody>
   <?php foreach ($res['rows'] as $r):
@@ -1089,7 +1285,8 @@ details pre{white-space:pre-wrap;word-break:break-all;max-width:70vw;font-family
             if (in_array((string) $k, $shown, true)) { continue; } ?>
           <span class="chip" title="<?= h(CMCD_KEY_INFO[(string) $k] ?? '') ?>"><b><?= h($k) ?></b><?= $v === true ? '' : '=' . h(fmt_cmcd_value($v)) ?></span>
         <?php endforeach; ?></td>
-      <td><span class="lbl"><?= h($r['src'] ?? '') ?></span><?php if (!empty($r['ip'])): ?><br><code><?= h($r['ip']) ?></code><?php endif; ?></td>
+      <td><?php if (!empty($r['ip'])): ?><a href="<?= $link(['ip' => $r['ip'], 'page' => '']) ?>" title="Show reports from this IP"><code><?= h($r['ip']) ?></code></a><?php endif; ?></td>
+      <td><span class="lbl"><?= h($r['src'] ?? '') ?></span></td>
       <td><details><summary>details</summary>
         <?php if (!empty($r['err']) || !empty($r['warn'])): ?><ul class="issues">
           <?php if (!empty($r['err'])): ?><li><?= h($r['err']) ?></li><?php endif; ?>
